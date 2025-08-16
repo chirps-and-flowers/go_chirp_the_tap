@@ -35,51 +35,89 @@ func _getGroupedBlockInfo(indexData []audio.IndexEntry, currentIndex int, sample
 		next = &indexData[currentIndex+1]
 	}
 
+	// Helper to check if a block type is a lead type
+	isLeadType := func(blockType string) bool {
+		return blockType == "lead" || blockType == "tt_head" || blockType == "cbm_head"
+	}
+
+	// Helper to check if a block type is a data type
+	isDataType := func(blockType string) bool {
+		return blockType == "data" || blockType == "tt_data" || blockType == "cbm_data"
+	}
+
 	// block grouping logic: check specific patterns of adjacent entry types.
 	// pauses alone are not considered exportable blocks in this logic.
 
-	// case 1: current entry is "lead".
-	// an exportable lead block requires an immediately following "pause".
-	if current.Type == "lead" {
+	// Case 1: Current is a lead type (lead, tt_head, cbm_lead)
+	if isLeadType(current.Type) {
+		// If followed by a pause, group lead + pause
 		if hasNext && next.Type == "pause" {
-			info.IsBlock = true                                     // found a lead+pause block
-			info.BlockType = "lead"                                 // type is lead
-			info.StartEntry = current                               // starts with the lead
-			info.EndEntry = next                                    // ends with the pause
-			info.BlockEndTime = _calculateEndTime(next, sampleRate) // end time is end of pause
-			info.ConsumedEntries = 2                                // consumed lead and pause
-		}
-
-	} else if current.Type == "data" {
-		// case 2: current entry is "data". check what follows.
-		if hasNext {
-			// case 2a: data followed by pause.
-			if next.Type == "pause" {
-				info.IsBlock = true                                     // found a data+pause block
-				info.BlockType = "data"                                 // type is data
-				info.StartEntry = current                               // starts with data
-				info.EndEntry = next                                    // ends with pause
-				info.BlockEndTime = _calculateEndTime(next, sampleRate) // end time is end of pause
-				info.ConsumedEntries = 2                                // consumed data and pause
-			} else if next.Type == "lead" {
-				// case 2b: data followed by lead
-				info.IsBlock = true                // found a data block
-				info.BlockType = "data"            // type is data
-				info.StartEntry = current          // starts with data
-				info.EndEntry = current            // ends with data (doesn't include the following lead)
-				info.BlockEndTime = next.StartTime // end time is effectively the start of the next block
-				info.ConsumedEntries = 1           // only consumed the data entry
-			}
-
+			info.IsBlock = true
+			info.BlockType = current.Type // Preserve specific lead type (tt_head, cbm_lead)
+			info.StartEntry = current
+			info.EndEntry = next
+			info.BlockEndTime = _calculateEndTime(next, sampleRate)
+			info.ConsumedEntries = 2
 		} else {
-			// case 3: final data block (current is data and last entry).
-			info.IsBlock = true                                        // found a data block
-			info.BlockType = "data"                                    // type is data
-			info.StartEntry = current                                  // starts with data
-			info.EndEntry = current                                    // ends with data
-			info.BlockEndTime = _calculateEndTime(current, sampleRate) // end time is end of this block
-			info.ConsumedEntries = 1                                   // only consumed this data entry
+			// If not followed by a pause, treat the lead as a standalone block
+			// This covers tt_head followed by tt_data, or cbm_lead followed by cbm_data, etc.
+			info.IsBlock = true
+			info.BlockType = current.Type // Preserve specific lead type
+			info.StartEntry = current
+			info.EndEntry = current
+			info.BlockEndTime = _calculateEndTime(current, sampleRate)
+			info.ConsumedEntries = 1
 		}
+	} else if isDataType(current.Type) {
+		// Case 2: Current is a data type (data, tt_data, cbm_data)
+		// If followed by a pause, group data + pause
+		if hasNext && next.Type == "pause" {
+			info.IsBlock = true
+			info.BlockType = current.Type // Preserve specific data type (tt_data, cbm_data)
+			info.StartEntry = current
+			info.EndEntry = next
+			info.BlockEndTime = _calculateEndTime(next, sampleRate)
+			info.ConsumedEntries = 2
+		} else if hasNext && isLeadType(next.Type) {
+			// If followed by a lead, treat data as a standalone block (lead will be processed next)
+			info.IsBlock = true
+			info.BlockType = current.Type // Preserve specific data type
+			info.StartEntry = current
+			info.EndEntry = current
+			info.BlockEndTime = _calculateEndTime(current, sampleRate) // End at current block's end
+			info.ConsumedEntries = 1
+		} else if hasNext && next.Type == "tt_trailer" { // NEW: tt_data followed by tt_trailer
+			info.IsBlock = true
+			info.BlockType = current.Type // Keep as tt_data, but extend its range
+			info.StartEntry = current
+			info.EndEntry = next // End at the end of the trailer
+			info.BlockEndTime = _calculateEndTime(next, sampleRate)
+			info.ConsumedEntries = 2 // Consume both tt_data and tt_trailer
+		} else {
+			// If it's the last entry or followed by something else, treat data as a standalone block
+			info.IsBlock = true
+			info.BlockType = current.Type // Preserve specific data type
+			info.StartEntry = current
+			info.EndEntry = current
+			info.BlockEndTime = _calculateEndTime(current, sampleRate)
+			info.ConsumedEntries = 1
+		}
+	} else if current.Type == "tt_trailer" {
+		// Case 4: Current is a Turbotape trailer.
+		// Treat it as a standalone exportable block.
+		info.IsBlock = true
+		info.BlockType = current.Type // Preserve "tt_trailer"
+		info.StartEntry = current
+		info.EndEntry = current
+		info.BlockEndTime = _calculateEndTime(current, sampleRate)
+		info.ConsumedEntries = 1
+	} else if current.Type == "pause" {
+		// Case 3: Current is a pause. Pauses are generally not exported as standalone blocks
+		// unless they are part of a lead+pause or data+pause group.
+		// If a pause is encountered here, it means it wasn't grouped with a preceding lead/data.
+		// We just consume it and don't mark it as an exportable block.
+		info.IsBlock = false
+		info.ConsumedEntries = 1
 	}
 
 	// check: ensure calculated block end time is not earlier than the start entry's end time.

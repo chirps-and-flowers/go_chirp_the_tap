@@ -22,4 +22,9 @@ const (
 
 	// sample rate
 	SampleRate = 44100.0
+
+	// pulse constants
+	PULSES_IN_BYTE = 8 // Default pulses per byte for generic readByte
+	PULSES_IN_CBM_BYTE = 20 // Pulses per byte for CBM format
+	DefaultTolerance = 16 // Default bit reading tolerance, from tapclean's DEFTOL
 )

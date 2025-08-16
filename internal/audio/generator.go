@@ -1,10 +1,10 @@
-// internal/audio/generator.go
 package audio
 
 import (
 	"fmt"
 	"go_chirp_the_tap/internal/constants"
 	"go_chirp_the_tap/internal/idx"
+	"go_chirp_the_tap/internal/loaders" // Import the loaders package
 	"math"
 	"sort"
 )
@@ -18,6 +18,9 @@ type IndexEntry struct {
 	StartPosition int     // start position in original tap file bytes (includes header offset)
 	EndPosition   int     // end position in original tap file bytes (includes header offset)
 	IDXTag        string  // holds matching tag from .idx file (set during merge); empty if no file or no match
+	RawData       []byte  // raw data of the block
+	BlockID       int     // block identifier
+	PilotEndPos   int     // end position of the pilot within the raw data
 }
 
 // ProcessTAPData converts raw .tap data into PCM samples
@@ -25,6 +28,8 @@ type IndexEntry struct {
 // and merges optional IDX data into it
 // and returns the resulting slice.
 func ProcessTAPData(tapData []byte, version byte, clock, sampleRate float64, idxEntries []idx.IDXEntry) ([]byte, []IndexEntry, error) {
+	_ = loaders.Ft[0] // Dummy call to satisfy unused import check during incremental development
+
 	if len(tapData) < constants.TapHeaderSize {
 		return nil, nil, fmt.Errorf("tap data too short: %d bytes, expected at least %d", len(tapData), constants.TapHeaderSize)
 	}
@@ -39,8 +44,10 @@ func ProcessTAPData(tapData []byte, version byte, clock, sampleRate float64, idx
 	indexData := make([]IndexEntry, 0, 512) // len=0, cap=512 (fixed)
 
 	currentSample := 0
-	currentPosition := constants.TapHeaderSize // start position after the header
-	i := constants.TapHeaderSize               // current index in tapData
+	currentPosition := 0     // start position from the beginning of tapData
+	i := 0                   // current index in tapData
+	expectedDataSize := 0    // state for turbotape data blocks
+	expectedTrailerSize := 0 // state for turbotape trailer blocks
 
 	// main loop: process tapdata byte stream block by block.
 	// 'i' advances based on the number of bytes consumed by each block.
@@ -54,24 +61,79 @@ func ProcessTAPData(tapData []byte, version byte, clock, sampleRate float64, idx
 		var blockBytesRead int
 		var blockType string
 		var err error
+		var totalCycles uint32
+		var blockID int
+		var pilotEndPos int // New variable
 
-		b := tapData[i]
+		if expectedDataSize > 0 {
+			// We have a pending data block to process (from a previous tt_head)
+			blockType = "tt_data"
+			blockBytesRead = expectedDataSize * constants.PULSES_IN_BYTE
+			fmt.Printf("DEBUG: ProcessTAPData: Processing expected data block of size %d bytes at offset %d\n", blockBytesRead, i)
 
-		// dispatch block processing based on current byte (0 = pause, non-zero = data/lead)
-		if b == 0 {
-			var cycles uint32 // limited to this block scope
-			blockPCM, blockBytesRead, cycles, err = _processPauseBlock(tapData, i, version, clock, sampleRate)
-			_ = cycles // assign cycles value to blank - avoiding unused variable error.
-			blockType = "pause"
+			// Generate PCM for the data block
+			for k := 0; k < blockBytesRead; k++ {
+				if i+k >= len(tapData) {
+					fmt.Printf("warning: tap data ended unexpectedly while reading expected data block at offset %d\n", i)
+					break
+				}
+				b := tapData[i+k]
+				pulseCycles := uint32(b) * 8
+				waveSamples := cyclesToSamples(pulseCycles, clock, sampleRate)
+				waveData := generateWave(waveSamples, 127)
+				blockPCM = append(blockPCM, waveData...)
+				totalCycles += pulseCycles
+			}
+			expectedDataSize = 0       // Reset the state
+			expectedTrailerSize = 7648 // Set for next iteration (Turbotape trailer)
+
+		} else if expectedTrailerSize > 0 {
+			// We have a pending Turbotape trailer to process
+			blockType = "tt_trailer"
+			blockBytesRead = expectedTrailerSize // Trailer size is in pulses
+			fmt.Printf("DEBUG: ProcessTAPData: Processing expected Turbotape trailer of size %d bytes at offset %d\n", blockBytesRead, i)
+
+			// Generate PCM for the trailer block
+			for k := 0; k < blockBytesRead; k++ {
+				if i+k >= len(tapData) {
+					fmt.Printf("warning: tap data ended unexpectedly while reading expected Turbotape trailer at offset %d\n", i)
+					break
+				}
+				b := tapData[i+k]
+				pulseCycles := uint32(b) * 8
+				waveSamples := cyclesToSamples(pulseCycles, clock, sampleRate)
+				waveData := generateWave(waveSamples, 127)
+				blockPCM = append(blockPCM, waveData...)
+				totalCycles += pulseCycles
+			}
+			expectedTrailerSize = 0 // Reset the state
 		} else {
-			var isLead bool
-			var totalCycles uint32 // limited to this block scope
-			blockPCM, isLead, blockBytesRead, totalCycles, err = _processDataLeadBlock(tapData, i, clock, sampleRate)
-			_ = totalCycles // assign cycles value to blank - avoiding unused variable error.
-			if isLead {
-				blockType = "lead"
+			b := tapData[i]
+
+			// dispatch block processing based on current byte (0 = pause, non-zero = data/lead)
+			if b == 0 {
+				blockPCM, blockBytesRead, totalCycles, err = _processPauseBlock(tapData, i, version, clock, sampleRate)
+				blockType = "pause"
 			} else {
-				blockType = "data"
+
+				var leadPcm []byte
+				var leadBytesRead int
+				var leadTotalCycles uint32
+				var leadBlockType string
+				var leadPsize int
+
+				// Modified call to _processDataLeadBlock
+				leadPcm, leadBytesRead, leadTotalCycles, leadBlockType, leadPsize, blockID, pilotEndPos, err = _processDataLeadBlock(tapData, i, clock, sampleRate)
+
+				blockPCM = leadPcm
+				blockBytesRead = leadBytesRead
+				blockType = leadBlockType
+				totalCycles = leadTotalCycles
+
+				if leadBlockType == "tt_head" {
+					expectedDataSize = leadPsize // Set for next iteration
+
+				}
 			}
 		}
 
@@ -103,6 +165,9 @@ func ProcessTAPData(tapData []byte, version byte, clock, sampleRate float64, idx
 			StartPosition: sectionStartPosition,
 			EndPosition:   currentPosition - 1,
 			IDXTag:        "", // tag populated later by merge
+			RawData:       tapData[sectionStartPosition:currentPosition],
+			BlockID:       blockID,
+			PilotEndPos:   pilotEndPos, // New field
 		})
 
 		// advance loop counter to the start of the next block
@@ -158,8 +223,8 @@ func mergeIDXData(indexData []IndexEntry, idxEntries []idx.IDXEntry) []IndexEntr
 				break
 			}
 
-			// check if the block overlaps the window and is a relevant type ("data" or "lead")
-			if (indexEntryToTest.Type == "data" || indexEntryToTest.Type == "lead") &&
+			// check if the block overlaps the window and is a relevant type ("data" or "lead" or "tt_lead" or "cbm_head")
+			if (indexEntryToTest.Type == "data" || indexEntryToTest.Type == "lead" || indexEntryToTest.Type == "tt_head" || indexEntryToTest.Type == "cbm_head") &&
 				indexEntryToTest.StartPosition <= maxPos && // block starts within or before window end
 				indexEntryToTest.EndPosition >= minPos { // block ends within or after window start (allows overlap)
 
@@ -236,11 +301,94 @@ func _processPauseBlock(tapData []byte, i int, version byte, clock, sampleRate f
 
 // _processDataLeadBlock handles a sequence of non-zero tap bytes, treating it as pulses.
 // it also determines if the sequence likely constitutes a leader tone.
-func _processDataLeadBlock(tapData []byte, i int, clock, sampleRate float64) (pcm []byte, isLead bool, bytesRead int, totalCycles uint32, err error) {
+func _processDataLeadBlock(tapData []byte, i int, clock, sampleRate float64) (pcm []byte, bytesRead int, totalCycles uint32, blockType string, psize int, blockID int, pilotEndPos int, err error) {
 	startOffset := i // remember starting position for lead tone check and error messages
 
-	// check if this block qualifies as a leader tone right from the start
-	isLead = isLeadTone(tapData, startOffset)
+	// Prioritize Turbotape 250 detection
+	isTTLead, ttLeadLength, blockID, psize, pilotEndPos := loaders.IsTurbotape250Lead(tapData, startOffset, constants.DefaultTolerance, constants.PULSES_IN_BYTE)
+	if isTTLead {
+		// Determine block type and calculate total bytes to read
+		blockType = "tt_head"
+		bytesRead = ttLeadLength
+		// pilotEndPos is already set from IsTurbotape250Lead
+
+		fmt.Printf("DEBUG: _processDataLeadBlock: Processing Turbotape 250 lead from offset %d, type: %s, length: %d\n", startOffset, blockType, bytesRead)
+
+		// Generate PCM for the lead portion only
+		for k := 0; k < bytesRead; k++ {
+			// Ensure we don't read past the end of tapData
+			if startOffset+k >= len(tapData) {
+				fmt.Printf("warning: tap data ended unexpectedly while reading turbotape lead at offset %d\n", startOffset)
+				break
+			}
+			b := tapData[startOffset+k]
+			pulseCycles := uint32(b) * 8
+			waveSamples := cyclesToSamples(pulseCycles, clock, sampleRate)
+			// generate the square wave for this pulse
+			waveData := generateWave(waveSamples, 127)
+			pcm = append(pcm, waveData...)
+			totalCycles += pulseCycles
+		}
+		return pcm, bytesRead, totalCycles, blockType, psize, blockID, pilotEndPos, nil
+	}
+
+	// Check for CBM lead
+	isCBMLead, cbmLeadLength, blockID, psize, pilotEndPos := loaders.IsCBMLead(tapData, startOffset, constants.DefaultTolerance, constants.PULSES_IN_CBM_BYTE)
+	if isCBMLead {
+		blockType = "cbm_head"
+		bytesRead = cbmLeadLength
+
+		fmt.Printf("DEBUG: _processDataLeadBlock: Processing CBM lead from offset %d, type: %s, length: %d\n", startOffset, blockType, bytesRead)
+
+		// Generate PCM for the lead portion only
+		for k := 0; k < bytesRead; k++ {
+			// Ensure we don't read past the end of tapData
+			if startOffset+k >= len(tapData) {
+				fmt.Printf("warning: tap data ended unexpectedly while reading cbm lead at offset %d\n", startOffset)
+				break
+			}
+			b := tapData[startOffset+k]
+			pulseCycles := uint32(b) * 8
+			waveSamples := cyclesToSamples(pulseCycles, clock, sampleRate)
+			// generate the square wave for this pulse
+			waveData := generateWave(waveSamples, 127)
+			pcm = append(pcm, waveData...)
+			totalCycles += pulseCycles
+		}
+		return pcm, bytesRead, totalCycles, blockType, psize, blockID, pilotEndPos, nil
+	} else { // Check for CBM data
+		isCBMData, cbmDataLength, blockID, psize, pilotEndPos := loaders.IsCBMData(tapData, startOffset, constants.DefaultTolerance, constants.PULSES_IN_CBM_BYTE)
+		if isCBMData {
+			blockType = "cbm_data"
+			bytesRead = cbmDataLength
+
+			fmt.Printf("DEBUG: _processDataLeadBlock: Processing CBM data from offset %d, type: %s, length: %d\n", startOffset, blockType, bytesRead)
+
+			// Generate PCM for the data portion only
+			for k := 0; k < bytesRead; k++ {
+				// Ensure we don't read past the end of tapData
+				if startOffset+k >= len(tapData) {
+					fmt.Printf("warning: tap data ended unexpectedly while reading cbm data at offset %d\n", startOffset)
+					break
+				}
+				b := tapData[startOffset+k]
+				pulseCycles := uint32(b) * 8
+				waveSamples := cyclesToSamples(pulseCycles, clock, sampleRate)
+				// generate the square wave for this pulse
+				waveData := generateWave(waveSamples, 127)
+				pcm = append(pcm, waveData...)
+				totalCycles += pulseCycles
+			}
+			return pcm, bytesRead, totalCycles, blockType, psize, blockID, pilotEndPos, nil
+		} else {
+			// Check for generic lead tone
+			if isLeadTone(tapData, startOffset) {
+				blockType = "lead" // Use "lead" for generic lead tones
+			} else {
+				blockType = "data" // Default to "data" if not a recognized lead
+			}
+		}
+	}
 
 	// pre-allocate pcm slice (estimate capacity)
 	pcm = make([]byte, 0, 1024) // initial capacity, will grow as needed
@@ -257,7 +405,7 @@ func _processDataLeadBlock(tapData []byte, i int, clock, sampleRate float64) (pc
 		// convert cycles to number of audio samples
 		waveSamples := cyclesToSamples(pulseCycles, clock, sampleRate)
 		// generate the square wave for this pulse
-		waveData := generateWave(waveSamples, 127) // use max amplitude (127)
+		waveData := generateWave(waveSamples, 127)
 		// append generated wave to the block's pcm data
 		pcm = append(pcm, waveData...)
 
@@ -273,7 +421,7 @@ func _processDataLeadBlock(tapData []byte, i int, clock, sampleRate float64) (pc
 		err = fmt.Errorf("no data bytes read in data/lead block starting at offset %d", startOffset)
 	}
 
-	return pcm, isLead, bytesRead, totalCycles, err
+	return pcm, bytesRead, totalCycles, blockType, 0, 0, 0, err
 }
 
 // _generatePause generates samples for pause durations using a specific 255/1 pattern

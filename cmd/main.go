@@ -93,33 +93,39 @@ func main() {
 	}
 	tapVersion = tapData[12] // offset 12 holds the version byte in cbm tap header v0/v1
 
-	tapPayload = tapData[constants.TapHeaderSize:]
+	tapPayload = tapData[constants.TapHeaderSize+4:]
 	fmt.Printf("TAP version: %d, Payload size: %d bytes\n", tapVersion, len(tapPayload))
 
 	// read .idx file
-	if _, err := os.Stat(idxFilePath); err == nil {
-		idxEntries, err = idx.ReadIDX(idxFilePath)
-		if err != nil {
-			// idx read error treated as non-fatal - we  just proceed without .idx metadata
-			log.Printf("Warning: Error reading IDX file '%s': %v...\n", idxFilePath, err)
-			idxEntries = nil
-		} else {
-			fmt.Printf("Read %d entries from IDX file: %s\n", len(idxEntries), idxFilePath)
-		}
-	} else if !os.IsNotExist(err) {
-		log.Printf("Warning: Error checking for IDX file '%s': %v...\n", idxFilePath, err)
-	} else {
-		fmt.Println("No IDX file found. Processing without IDX data.")
-	}
+    if _, err := os.Stat(idxFilePath); err == nil {
+        idxEntries, err = idx.ReadIDX(idxFilePath)
+        if err != nil {
+            // idx read error treated as non-fatal - we  just proceed without .idx metadata
+            log.Printf("Warning: Error reading IDX file '%s': %v...\n", idxFilePath, err)
+            idxEntries = nil
+        } else {
+            fmt.Printf("Read %d entries from IDX file: %s\n", len(idxEntries), idxFilePath)
+        }
+    } else if !os.IsNotExist(err) {
+        log.Printf("Warning: Error checking for IDX file '%s': %v...\n", idxFilePath, err)
+    } else {
+        fmt.Println("No IDX file found. Processing without IDX data.")
+    }
 
-	// process .tap (and .idx if available)
-	fmt.Println("Processing TAP data into audio...")
+    // process .tap (and .idx if available)
+    fmt.Println("Processing TAP data into audio...")
 
-	pcmSamples, indexData, err = audio.ProcessTAPData(tapData, tapVersion, selectedClock, constants.SampleRate, idxEntries)
-	if err != nil {
-		log.Fatalf("Error processing TAP data: %v", err)
-	}
-	fmt.Printf("Generated %d PCM samples. Found %d raw index entries.\n", len(pcmSamples), len(indexData))
+        pcmSamples, indexData, err = audio.ProcessTAPData(tapPayload, tapVersion, selectedClock, constants.SampleRate, idxEntries)
+    if err != nil {
+        log.Fatalf("Error processing TAP data: %v", err)
+    }
+    fmt.Printf("Generated %d PCM samples. Found %d raw index entries.\n", len(pcmSamples), len(indexData))
+
+    // If no .idx file was found, try to extract headers from the tap file itself
+    if len(idxEntries) == 0 {
+        fmt.Println("No .idx file found, attempting to extract headers from .tap file.")
+        tap.ExtractAndApplyHeaders(indexData)
+    }
 
 	// generate output
 	if *cpk {

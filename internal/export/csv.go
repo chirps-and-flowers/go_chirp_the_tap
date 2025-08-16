@@ -55,6 +55,7 @@ func ExportBlockInfo(indexData []audio.IndexEntry, outputPath string, sampleRate
 			safeIDXTag = strings.ReplaceAll(safeIDXTag, "\n", " ")
 			safeIDXTag = strings.ReplaceAll(safeIDXTag, "|", " ")
 
+			fmt.Printf("DEBUG: ExportBlockInfo: Writing block type: %s\n", groupInfo.BlockType)
 			// write line to buffer - use \t for columns, | as visual separator and trailing tab + newline
 			_, err = fmt.Fprintf(w, "%.6f\t|\t%.6f\t|\t%s\t|\t%s\t|\t%s\t|\t%s\t\n",
 				groupInfo.StartEntry.StartTime,
